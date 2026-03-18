@@ -23,4 +23,4 @@ cv2.waitKey(0)
 cv2.destroyAllWindows()
 
 # Сохраняем результат
-cv2.imwrite('battery_with_contours.png', image_color)
+cv2.imwrite('battery_with_contours.png', image_color) 
