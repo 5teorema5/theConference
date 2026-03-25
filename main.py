@@ -1,86 +1,87 @@
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-import cv2
-import numpy as np
-from tqdm import tqdm  # для красивого прогресс-бара
+import torch.nn.functional as F
 
-# --- 1. Модель (U-Net) ---
-class UNet(nn.Module):
-    def __init__(self, in_channels=1, out_channels=4):
+class DoubleConv(nn.Module):
+    """(Conv -> BN -> ReLU) x 2"""
+    def __init__(self, in_channels, out_channels):
         super().__init__()
-        # Здесь будет архитектура U-Net (кодировщик + декодировщик)
-        # Я опустил детали для краткости, но они есть в open source
-        pass
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
 
-# --- 2. Датасет с аугментацией ---
-class BatteryDataset(Dataset):
-    def __init__(self, image_paths, mask_paths, transform=None):
-        self.images = image_paths
-        self.masks = mask_paths
-        self.transform = transform
+    def forward(self, x):
+        return self.double_conv(x)
 
-    def __len__(self):
-        return len(self.images)
+class Down(nn.Module):
+    """Максимальный пулинг + DoubleConv"""
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.maxpool_conv = nn.Sequential(
+            nn.MaxPool2d(2),
+            DoubleConv(in_channels, out_channels)
+        )
 
-    def __getitem__(self, idx):
-        image = cv2.imread(self.images[idx], cv2.IMREAD_GRAYSCALE)
-        mask = cv2.imread(self.masks[idx], cv2.IMREAD_GRAYSCALE)
+    def forward(self, x):
+        return self.maxpool_conv(x)
 
-        if self.transform:
-            augmented = self.transform(image=image, mask=mask)
-            image = augmented['image']
-            mask = augmented['mask']
+class Up(nn.Module):
+    """Апсемплинг + DoubleConv"""
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
+        self.conv = DoubleConv(in_channels, out_channels)
 
-        # mask должен быть типа long (классы)
-        mask = mask.long()
-        return image, mask
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+        # Обрезаем x2 если размеры не совпадают
+        diffY = x2.size()[2] - x1.size()[2]
+        diffX = x2.size()[3] - x1.size()[3]
+        x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
+                        diffY // 2, diffY - diffY // 2])
+        x = torch.cat([x2, x1], dim=1)
+        return self.conv(x)
 
-# --- 3. Трансформации (аугментации) ---
-transform = A.Compose([
-    A.Resize(256, 256),
-    A.RandomRotate90(p=0.5),
-    A.HorizontalFlip(p=0.3),
-    A.RandomBrightnessContrast(p=0.3),
-    A.Normalize(mean=(0.5), std=(0.5)),
-    ToTensorV2()
-])
+class OutConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(OutConv, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
 
-# --- 4. Загрузка данных ---
-dataset = BatteryDataset(
-    image_paths=['img1.png', 'img2.png', ...],
-    mask_paths=['mask1.png', 'mask2.png', ...],
-    transform=transform
-)
-dataloader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=2)
+    def forward(self, x):
+        return self.conv(x)
 
-# --- 5. Инициализация ---
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = UNet(in_channels=1, out_channels=4).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-criterion = nn.CrossEntropyLoss()  # можно заменить на DiceLoss
+class UNet(nn.Module):
+    def __init__(self, n_channels=1, n_classes=1, features=[64, 128, 256, 512]):
+        super(UNet, self).__init__()
+        self.inc = DoubleConv(n_channels, features[0])
+        self.down1 = Down(features[0], features[1])
+        self.down2 = Down(features[1], features[2])
+        self.down3 = Down(features[2], features[3])
+        
+        self.up1 = Up(features[3], features[2])
+        self.up2 = Up(features[2], features[1])
+        self.up3 = Up(features[1], features[0])
+        self.outc = OutConv(features[0], n_classes)
 
-# --- 6. ЦИКЛ ОБУЧЕНИЯ (главная часть) ---
-num_epochs = 50
-for epoch in range(num_epochs):
-    model.train()  # переводим модель в режим обучения
-    running_loss = 0.0
+    def forward(self, x):
+        x1 = self.inc(x)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+        
+        x = self.up1(x4, x3)
+        x = self.up2(x, x2)
+        x = self.up3(x, x1)
+        logits = self.outc(x)
+        return logits
 
-    for images, masks in tqdm(dataloader, desc=f'Epoch {epoch+1}'):
-        images = images.to(device)
-        masks = masks.to(device)
-
-        # Шаг 1: forward pass
-        outputs = model(images)  # ❗ здесь сеть считает предсказания
-        loss = criterion(outputs, masks)
-
-        # Шаг 2: backward pass
-        optimizer.zero_grad()   # обнуляем старые градиенты
-        loss.backward()         # ❗ вычисляем градиенты (производные)
-        optimizer.step()        # ❗ обновляем веса
-
-        running_loss += loss.item()
-
-    print(f'Epoch {epoch+1}, Loss: {running_loss/len(dataloader):.4f}')
+if __name__ == "__main__":
+    model = UNet(n_channels=1, n_classes=1)
+    x = torch.randn(1, 1, 256, 256)
+    y = model(x)
+    print(f"Input: {x.shape} -> Output: {y.shape}")
